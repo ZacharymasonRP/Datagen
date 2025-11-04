@@ -321,11 +321,32 @@ def generate_records(tpl: Dict[str, Any], count: int, id_mode: str) -> List[Dict
         if title_template:
             rec["Title"] = apply_hashes(apply_tokens(title_template, rec), rec["_Seq_"])
 
-        # Source URL (supports connector-style or https). Allow {ExternalID} or other placeholders.
-        rec["SourceURL"] = build_url(source_url_pattern, rec)
+            # Source URL (supports connector-style or https). Allow {ExternalID} or other placeholders.
+            rec["SourceURL"] = build_url(source_url_pattern, rec)
 
-        # Done
-        records.append(rec)
+            # --- C) Dynamic Title + Notes ---
+            title, notes = None, None
+            if args.text_mode == "grammar":
+                title, notes = synthesize_title_and_notes(rec, tpl)
+            elif args.text_mode == "llm-plugin":
+                if not args.llm_plugin:
+                    raise RuntimeError("--llm-plugin must point to a python file when text-mode=llm-plugin")
+                _gen = _load_llm_plugin(args.llm_plugin)
+                out = _gen(rec, tpl)
+                title, notes = out.get("title"), out.get("notes")
+
+            # If template also provided a titleTemplate, keep it as a fallback
+            if not title:
+                if title_template:
+                    title = apply_hashes(apply_tokens(title_template, rec), rec["_Seq_"])
+                else:
+                    title = f'{rec["ExternalID"]} - {rec.get("Category","")} - {rec.get("ProjectCode","")}'
+
+            rec["Title"] = title
+            rec["Notes"] = notes or ""
+
+            # Done
+            records.append(rec)
 
     return records
 
