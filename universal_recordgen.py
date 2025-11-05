@@ -124,6 +124,26 @@ def apply_tokens(pattern: str, tokens: Dict[str, Any]) -> str:
         return str(tokens.get(k, f"{{{k}}}"))
     s = re.sub(r"{([^#}][^}]*)}", repl, pattern)  # avoid {###} which we handle separately
     return s
+def random_datetimes(start: datetime, end: datetime, n: int) -> List[datetime]:
+    """Uniform random datetimes inside [start, end]."""
+    span = max(1.0, (end - start).total_seconds())
+    out: List[datetime] = []
+    for _ in range(n):
+        out.append(start + timedelta(seconds=random.random() * span))
+    return out
+
+def make_drawer(values: List[str]):
+    """Return a function that cycles through all values in random order (balanced distribution)."""
+    bag: List[str] = []
+    def draw() -> str:
+        nonlocal bag
+        if not isinstance(values, list) or not values:
+            return ""
+        if not bag:
+            bag = values[:]
+            random.shuffle(bag)
+        return bag.pop()
+    return draw
 def _pick(seq):  # safe random choice
     return random.choice(seq) if isinstance(seq, list) and seq else ""
 
@@ -226,42 +246,68 @@ def build_url(pattern: str, record: Dict[str, Any]) -> str:
     s = apply_hashes(s, record.get("_Seq_", 1))
     # accept either connector-style ("Databricks:/...") or http(s)
     return s
+from typing import Optional
 
-def generate_records(tpl: Dict[str, Any], count: int, id_mode: str) -> List[Dict[str, Any]]:
+def generate_records(
+    tpl: Dict[str, Any],
+    count: int,
+    id_mode: str,
+    text_mode: str = "grammar",
+    llm_plugin: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     # Base parameters
     class_code = tpl.get("classCode", "COM-GEN")
     category_name = tpl.get("categoryName", "General")
     connector = tpl.get("connector", "Databricks")
     id_field = tpl.get("idField")  # optional legacy, e.g., "MinuteID"
-    author_field = tpl.get("authorField")  # optional legacy
-    title_template = tpl.get("titleTemplate", "")  # optional
+    title_template = tpl.get("titleTemplate", "")  # optional fallback
     source_url_pattern = tpl.get("sourceUrlPattern", "{SourceURL}")
     id_pattern = tpl.get("idPattern", "{PREFIX}-{CLASSCODE}-{YYYY}{MM}{DD}-{####}")
     id_prefix = tpl.get("idPrefix", "MNM")
     cadence = tpl.get("cadence", "monthly")  # daily | monthly | mixed
 
-    # Date range
+    # --- Date window (never go past today) ---
     dr = tpl.get("dateRange", {"start": "2016-01-01", "end": "2025-10-31"})
-    start = parse_dt(dr["start"]); end = parse_dt(dr["end"])
+    start = parse_dt(dr["start"])
+    end = parse_dt(dr["end"])
+    today = datetime.now(timezone.utc)
+    horizon = min(end, today)
+    if start > horizon:  # guard against a future-only range
+        start = horizon - timedelta(days=30)
+
+    # --- Build initial schedule inside [start, horizon] ---
+    when_list: List[datetime] = []
     if cadence == "daily":
-        when_list = day_sequence(start, end, count)
+        days_in_range = (horizon - start).days + 1
+        seed_n = min(count, max(1, days_in_range))
+        when_list = day_sequence(start, horizon, seed_n)
     elif cadence == "mixed":
-        # half monthly, half daily for variation
         half = max(1, count // 2)
-        when_list = month_sequence(start, end, count - half) + day_sequence(start, end, half)
-        random.shuffle(when_list)
-        when_list = when_list[:count]
-    else:
-        when_list = month_sequence(start, end, count)
+        seed_n = max(1, count - half)
+        # monthly-ish seeds + random fillers
+        when_list = month_sequence(start, horizon, seed_n)
+        when_list = [min(w, horizon) for w in when_list]
+        if len(when_list) < count:
+            when_list += random_datetimes(start, horizon, count - len(when_list))
+    else:  # monthly
+        # seed with month-based dates, then fill remainder randomly
+        months_in_range = (horizon.year - start.year) * 12 + (horizon.month - start.month) + 1
+        seed_n = min(count, max(1, months_in_range))
+        when_list = month_sequence(start, horizon, seed_n)
+        when_list = [min(w, horizon) for w in when_list]
+        if len(when_list) < count:
+            when_list += random_datetimes(start, horizon, count - len(when_list))
 
-    # Options pool
+    # exact length and clamp every element to horizon
+    when_list = [min(w, horizon) for w in when_list[:count]]
+
+    # Options + balanced drawers for variety
     opts: Dict[str, Any] = tpl.get("options", {})
+    draw_project = make_drawer(opts.get("ProjectCode", [f"{class_code}-CORE"]))
+    draw_author  = make_drawer(opts.get("Author", ["Hannah Kim", "Chloe Davies", "Lara Bennett"]))
 
-    # Prebuild numeric indices for {####}
-    if id_mode == "random":
-        indices = random.sample(range(1, count + 1), count)
-    else:
-        indices = list(range(1, count + 1))
+    # Indices for {####}
+    indices = random.sample(range(1, count + 1), count) if id_mode == "random" else list(range(1, count + 1))
 
     records: List[Dict[str, Any]] = []
 
@@ -269,24 +315,25 @@ def generate_records(tpl: Dict[str, Any], count: int, id_mode: str) -> List[Dict
         when = when_list[i]
         idx = indices[i]
 
-        # --- Choices (you can extend options freely in each template) ---
         # Category / ProjectCode
         category = opts.get("Category", [category_name])[0] if isinstance(opts.get("Category"), list) else category_name
-        project_code = pick_from_options(opts, ["ProjectCode", "Projects", "ProjectCodes"], [f"{class_code}-CORE"])
+        project_code = draw_project() or f"{class_code}-CORE"
 
-        # Author / CreatedBy / ModifiedBy — use explicit "Author" if present; else fall back to common legacy keys
-        author = pick_from_options(opts, AUTHOR_ALIASES, ["Hannah Kim", "Chloe Davies", "Lara Bennett"])
+        # People
+        author = draw_author() or "Hannah Kim"
         created_by = pick_from_options(opts, CREATED_BY_ALIASES, [author])
         modified_by = pick_from_options(opts, MODIFIED_BY_ALIASES, [author])
 
-        # External ID (unique)
+        # External ID and dates (keep inside [start, horizon], created <= modified)
         external_id = build_external_id(id_pattern, class_code, when, idx, id_prefix)
-
-        # Dates: Created ≤ Modified
         created_date = (when + timedelta(days=random.randint(0, 7), hours=random.randint(0, 6))).astimezone(timezone.utc)
         modified_date = created_date + timedelta(days=random.randint(0, 14), hours=random.randint(0, 18))
+        if modified_date > horizon:
+            modified_date = horizon
+        if created_date > modified_date:
+            created_date = modified_date - timedelta(hours=random.randint(1, 12))
 
-        # Start record with mandatory mapping fields (exact names)
+        # Base record (MANDATORY mapping fields + helpers)
         rec: Dict[str, Any] = {
             "ExternalID": external_id,
             "Author": author,
@@ -294,62 +341,56 @@ def generate_records(tpl: Dict[str, Any], count: int, id_mode: str) -> List[Dict
             "SourceCreatedBy": created_by,
             "SourceLastModifiedDate": iso_z(modified_date),
             "SourceLastModifiedBy": modified_by,
-            # We'll compute SourceURL after we know everything else:
-            # "SourceURL": "...",
-            # Helpful extra mapping inputs:
             "Category": category,
             "ProjectCode": project_code,
-            # Useful context fields (becomes source properties in rpsubmit):
             "ClassCode": class_code,
             "CategoryName": category_name,
             "Connector": connector,
-            "_Seq_": idx  # internal helper for {####} in patterns
+            "_Seq_": idx
         }
 
-        # For legacy templates that expect an internal ID field (e.g., "MinuteID"), mirror ExternalID.
+        # Legacy alias if needed
         if id_field and isinstance(id_field, str) and id_field.strip():
             rec[id_field] = external_id
+        # If your config still uses {TransactionID}, uncomment:
+        # rec["TransactionID"] = external_id
 
-        # Include additional option-driven fields (positions, notes, etc.)
+        # Add any other option fields randomly (don’t overwrite existing keys)
         for k, v in opts.items():
-            if isinstance(v, list) and v:
-                # Avoid clobbering mandatory mapping fields
-                if k not in rec:
-                    rec[k] = random.choice(v)
+            if isinstance(v, list) and v and k not in rec:
+                rec[k] = random.choice(v)
 
-        # Title (optional, for readability in JSON; the loader will compute title from mapping independently)
+        # Optional static title fallback from template
         if title_template:
             rec["Title"] = apply_hashes(apply_tokens(title_template, rec), rec["_Seq_"])
 
-            # Source URL (supports connector-style or https). Allow {ExternalID} or other placeholders.
-            rec["SourceURL"] = build_url(source_url_pattern, rec)
+        # ALWAYS set SourceURL
+        rec["SourceURL"] = build_url(source_url_pattern, rec)
 
-            # --- C) Dynamic Title + Notes ---
-            title, notes = None, None
-            if args.text_mode == "grammar":
-                title, notes = synthesize_title_and_notes(rec, tpl)
-            elif args.text_mode == "llm-plugin":
-                if not args.llm_plugin:
-                    raise RuntimeError("--llm-plugin must point to a python file when text-mode=llm-plugin")
-                _gen = _load_llm_plugin(args.llm_plugin)
-                out = _gen(rec, tpl)
-                title, notes = out.get("title"), out.get("notes")
+        # Dynamic Title + Notes
+        title, notes = None, None
+        if text_mode == "grammar":
+            title, notes = synthesize_title_and_notes(rec, tpl)
+        elif text_mode == "llm-plugin":
+            if not llm_plugin:
+                raise RuntimeError("--llm-plugin must point to a python file when text-mode=llm-plugin")
+            _gen = _load_llm_plugin(llm_plugin)
+            out = _gen(rec, tpl)
+            title, notes = out.get("title"), out.get("notes")
 
-            # If template also provided a titleTemplate, keep it as a fallback
-            if not title:
-                if title_template:
-                    title = apply_hashes(apply_tokens(title_template, rec), rec["_Seq_"])
-                else:
-                    title = f'{rec["ExternalID"]} - {rec.get("Category","")} - {rec.get("ProjectCode","")}'
+        # Finalize Title + Notes
+        if not title:
+            if title_template:
+                title = apply_hashes(apply_tokens(title_template, rec), rec["_Seq_"])
+            else:
+                title = f'{rec["ExternalID"]} - {rec.get("Category","")} - {rec.get("ProjectCode","")}'
+        rec["Title"] = title
+        rec["Notes"] = notes or ""
 
-            rec["Title"] = title
-            rec["Notes"] = notes or ""
-
-            # Done
-            records.append(rec)
+        # Append on EVERY iteration
+        records.append(rec)
 
     return records
-
 # -----------------------------
 # Main
 # -----------------------------
@@ -364,7 +405,13 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    recs = generate_records(tpl, count, id_mode=args.id_mode)
+    recs = generate_records(
+    tpl,
+    count,
+    id_mode=args.id_mode,
+    text_mode=args.text_mode,
+    llm_plugin=args.llm_plugin,
+)
 
     # Final validation: ensure required mapping names exist on every record
     required = [
